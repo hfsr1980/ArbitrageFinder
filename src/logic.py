@@ -1,7 +1,9 @@
 from typing import Iterable, Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import time
 import requests
-from itertools import chain
+from requests.adapters import HTTPAdapter
 
 try:
     from tqdm import tqdm
@@ -10,6 +12,30 @@ except ImportError:
 
 BASE_URL = "api.the-odds-api.com/v4"
 PROTOCOL = "https://"
+TIMEOUT = 15  # seconds per request
+MAX_WORKERS = 8  # concurrent requests to the API
+MAX_RETRIES = 3  # retries on rate limiting (HTTP 429)
+
+_thread_local = threading.local()
+
+
+def _session() -> requests.Session:
+    """One pooled session per thread, so connections (TLS handshakes) are reused across requests."""
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+        session.mount(PROTOCOL, HTTPAdapter(pool_connections=1, pool_maxsize=1))
+        _thread_local.session = session
+    return _thread_local.session
+
+
+def _get(url: str, params: dict) -> requests.Response:
+    """GET with a timeout and exponential backoff when rate limited."""
+    for attempt in range(MAX_RETRIES + 1):
+        response = _session().get(url, params=params, timeout=TIMEOUT)
+        if response.status_code != 429 or attempt == MAX_RETRIES:
+            return response
+        time.sleep(2 ** attempt)
+    return response
 
 
 class APIException(RuntimeError):
@@ -39,7 +65,7 @@ def get_sports(key: str) -> set[str]:
     escaped_url = PROTOCOL + requests.utils.quote(url)
     querystring = {"apiKey": key}
 
-    response = requests.get(escaped_url, params=querystring)
+    response = _get(escaped_url, querystring)
     if not response:
         handle_faulty_response(response)
 
@@ -56,7 +82,7 @@ def get_data(key: str, sport: str, region: str = "eu"):
         "dateFormat": "unix"
     }
 
-    response = requests.get(escaped_url, params=querystring)
+    response = _get(escaped_url, querystring)
     if not response:
         handle_faulty_response(response)
 
@@ -96,10 +122,28 @@ def process_data(matches: Iterable, include_started_matches: bool = True) -> Gen
         }
 
 
+def fetch_all_matches(key: str, sports: Iterable[str], region: str) -> list:
+    """Fetches the odds for every sport concurrently instead of one request at a time."""
+    matches = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(get_data, key, sport, region): sport for sport in sports}
+        progress = tqdm(as_completed(futures), total=len(futures), desc="Fetching odds", leave=False, unit=" sports")
+        for future in progress:
+            try:
+                data = future.result()
+            except AuthenticationException:
+                raise
+            except (APIException, requests.RequestException) as e:
+                print(f"Skipping {futures[future]}: {e}")
+                continue
+            if isinstance(data, list):
+                matches.extend(data)
+    return matches
+
+
 def get_arbitrage_opportunities(key: str, region: str, cutoff: float):
     sports = get_sports(key)
-    data = chain.from_iterable(get_data(key, sport, region=region) for sport in sports)
-    data = filter(lambda x: x != "message", data)
+    data = fetch_all_matches(key, sports, region)
     results = process_data(data)
     arbitrage_opportunities = filter(lambda x: 0 < x["total_implied_odds"] < 1-cutoff, results)
 
